@@ -1,0 +1,168 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: zh_Hant\n"
+"Project-Id-Version: luci-app-jdcguest\n"
+
+msgid "Guest network"
+msgstr "訪客網路"
+
+msgid "An isolated wireless network for guests. The guest zone is denied access to the LAN and reaches the internet through NAT."
+msgstr "為訪客提供的隔離無線網路。訪客區域禁止存取內網，並透過 NAT 連線至外部網路。"
+
+msgid "Settings"
+msgstr "設定"
+
+msgid "Enable"
+msgstr "啟用"
+
+msgid "Clearing this removes the guest network on apply."
+msgstr "取消勾選後，套用時將移除訪客網路。"
+
+msgid "2.4 GHz SSID"
+msgstr "2.4 GHz SSID"
+
+msgid "5 GHz SSID"
+msgstr "5 GHz SSID"
+
+msgid "Served by %s."
+msgstr "由 %s 提供。"
+
+msgid "Passphrase"
+msgstr "無線密碼"
+
+msgid "WPA2-PSK, 8 to 63 characters. Leave blank to keep the current passphrase."
+msgstr "WPA2-PSK，8 至 63 個字元。留空代表保持目前密碼不變。"
+
+msgid "The passphrase must be between 8 and 63 characters."
+msgstr "無線密碼長度必須為 8 至 63 個字元。"
+
+msgid "A 2.4 GHz SSID is required."
+msgstr "2.4 GHz SSID 不可為空。"
+
+msgid "The SSID may not exceed 32 characters."
+msgstr "SSID 長度不可超過 32 個字元。"
+
+msgid "Guest subnet"
+msgstr "訪客網段"
+
+msgid "Leave on automatic to pick a range that does not clash with the LAN or WAN."
+msgstr "保持「自動」以選擇與內網、外部網路都不衝突的網段。"
+
+msgid "Use CIDR notation, for example 192.168.50.1/24."
+msgstr "請使用 CIDR 格式，例如 192.168.50.1/24。"
+
+msgid "First address"
+msgstr "起始位址偏移"
+
+msgid "Offset from the guest subnet."
+msgstr "相對訪客網段起始位址的偏移量。"
+
+msgid "Address pool size"
+msgstr "位址集區大小"
+
+msgid "Number of addresses handed out to guests."
+msgstr "分配給訪客的位址數量。"
+
+msgid "Enter a number between %d and %d."
+msgstr "請輸入 %d 到 %d 之間的數字。"
+
+msgid "Isolate 2.4 GHz clients"
+msgstr "隔離 2.4 GHz 用戶端"
+
+msgid "Blocks traffic between guests on the 2.4 GHz SSID."
+msgstr "禁止 2.4 GHz SSID 上訪客之間互相存取。"
+
+msgid "Isolate 5 GHz clients"
+msgstr "隔離 5 GHz 用戶端"
+
+msgid "Blocks traffic between guests on the 5 GHz SSID."
+msgstr "禁止 5 GHz SSID 上訪客之間互相存取。"
+
+msgid "Detected hardware"
+msgstr "偵測到的硬體"
+
+msgid "Radio"
+msgstr "無線電"
+
+msgid "Band"
+msgstr "頻段"
+
+msgid "Channel"
+msgstr "頻道"
+
+msgid "DFS"
+msgstr "DFS"
+
+msgid "Path"
+msgstr "實體路徑"
+
+msgid "yes"
+msgstr "是"
+
+msgid "no"
+msgstr "否"
+
+msgid "Current state"
+msgstr "目前狀態"
+
+msgid "Board"
+msgstr "裝置型號標識"
+
+msgid "Model"
+msgstr "裝置型號"
+
+msgid "Selected radios"
+msgstr "選用的無線電"
+
+msgid "enabled"
+msgstr "已啟用"
+
+msgid "not configured"
+msgstr "尚未設定"
+
+msgid "dnsmasq nonwildcard"
+msgstr "dnsmasq nonwildcard"
+
+msgid "on, guest registered"
+msgstr "已開啟，訪客介面已註冊"
+
+msgid "on, guest not registered"
+msgstr "已開啟，訪客介面未註冊"
+
+msgid "off"
+msgstr "已關閉"
+
+msgid "Attention"
+msgstr "注意"
+
+msgid "Remove guest network"
+msgstr "移除訪客網路"
+
+msgid "Guest network applied."
+msgstr "訪客網路已套用。"
+
+msgid "Subnet %s, 2.4 GHz on %s, 5 GHz on %s."
+msgstr "網段 %s，2.4 GHz 使用 %s，5 GHz 使用 %s。"
+
+msgid "Applying the guest network failed."
+msgstr "套用訪客網路失敗。"
+
+msgid "Guest network removed."
+msgstr "訪客網路已移除。"
+
+msgid "Removing the guest network failed."
+msgstr "移除訪客網路失敗。"
+
+msgid "dnsmasq runs with nonwildcard=1 and the guest interface is not a listening interface. Applying registers it, otherwise no guest would ever receive a lease."
+msgstr "dnsmasq 以 nonwildcard=1 執行，但訪客介面未註冊為監聽介面。套用後會自動註冊，否則訪客將永遠無法取得位址。"
+
+msgid "The only 5 GHz radio sits on a DFS channel. The 5 GHz guest SSID is skipped so it does not disappear during radar detection."
+msgstr "僅有的 5 GHz 無線電位於 DFS 頻道。為避免雷達偵測期間中斷，將略過 5 GHz 訪客 SSID。"
+
+msgid "2.4 GHz"
+msgstr "2.4 GHz"
+
+msgid "5 GHz"
+msgstr "5 GHz"
