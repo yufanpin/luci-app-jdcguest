@@ -1,0 +1,562 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# luci-app-jdcguest rpcd exec backend.
+#
+# Device profile: JDCloud RE-CS-02 (jdcloud,re-cs-02), Qualcomm IPQ6000.
+# That board carries three mac80211 PHYs:
+#
+#   radio0  5 GHz  ch 100  HE80   onboard, DFS band
+#   radio1  2.4 GHz ch 1   HE20  onboard
+#   radio2  5 GHz  ch 36   HE80   PCIe module, non-DFS
+#
+# Everything below is written against observations that are specific to that
+# layout rather than to a generic "two radio" assumption:
+#
+#   * The guest 5 GHz SSID is pinned to a non-DFS channel. A guest network on a
+#     DFS radio goes silent for tens of seconds after every boot while hostapd
+#     runs radar detection, and the channel may change under the user.
+#   * dnsmasq runs with nonwildcard=1 on this firmware, so a new interface has
+#     to be registered in the listener list or guests never receive a lease.
+#   * The firewall is fw4/nftables. Nothing here writes iptables rules.
+#
+# Input:  JSON-RPC 2.0 request on stdin  {"method":"...","params":{...}}
+# Output: JSON-RPC 2.0 response on stdout
+
+BACKUP_DIR=/tmp/.jdcguest-backup
+GUEST_BRIDGE=br-guest
+GUEST_NETIFACE=jdcguest
+GUEST_ZONE=jdcguest
+CONFIG_FILES="network wireless firewall dhcp"
+
+# 5 GHz channels subject to radar detection (UNII-2 and UNII-3).
+DFS_CHANNELS=" 52 56 60 64 68 96 100 104 108 112 116 120 124 128 132 136 140 144 "
+
+# Guest subnets tried in order. 192.168.10.0/24 and 10.0.0.0/24 are excluded on
+# purpose: the WAN leg of this board is commonly 192.168.10.0/24 and the default
+# LAN is 10.0.0.0/24, so both are already spoken for before the plugin runs.
+SUBNET_CANDIDATES="192.168.50.1/24 192.168.60.1/24 192.168.70.1/24 192.168.80.1/24 192.168.90.1/24 10.0.50.1/24"
+
+# ---------------------------------------------------------------------------
+# output helpers
+# ---------------------------------------------------------------------------
+
+json_escape() {
+	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' | tr -d '\r\n'
+}
+
+reply_ok() {
+	printf '{"jsonrpc":"2.0","id":1,"result":%s}\n' "$1"
+}
+
+reply_err() {
+	printf '{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"%s"}}\n' "$(json_escape "$1")"
+}
+
+# ---------------------------------------------------------------------------
+# device inspection
+# ---------------------------------------------------------------------------
+
+is_dfs_channel() {
+	case "$DFS_CHANNELS" in
+		*" $1 "*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# Emits "<section> <band> <channel>" for every wifi-device in /etc/config/wireless.
+list_radios() {
+	uci -q show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'
+}
+
+# Emits the guest-capable radio for a band as "<section> <channel> <reason>".
+# For 5 GHz a DFS channel disqualifies the radio unless it is the only one left,
+# which is reported through the reason field so the UI can explain the choice.
+pick_radio() {
+	want_band=$1
+	prefer_non_dfs=$2
+	first=""
+	first_channel=""
+
+	for radio in $(list_radios); do
+		band=$(uci -q get "wireless.$radio.band")
+		[ "$band" = "$want_band" ] || continue
+
+		channel=$(uci -q get "wireless.$radio.channel")
+		[ -n "$channel" ] || channel=$(uci -q get "wireless.$radio.channel_list")
+		[ -n "$channel" ] || continue
+
+		if [ -z "$first" ]; then
+			first=$radio
+			first_channel=$channel
+		fi
+
+		if [ "$prefer_non_dfs" = "1" ] && is_dfs_channel "$channel"; then
+			continue
+		fi
+
+		printf '%s %s ok\n' "$radio" "$channel"
+		return 0
+	done
+
+	if [ -n "$first" ]; then
+		printf '%s %s dfs-only\n' "$first" "$first_channel"
+		return 0
+	fi
+	return 1
+}
+
+# Emits every IPv4 subnet already configured on a network interface.
+used_subnets() {
+	uci -q show network | sed -n "s/^network\.[^.=]*\.ipaddr='\([0-9.]\{1,\}\)\/[0-9]\{1,\}'$/\1/p"
+}
+
+# First candidate that shares no /24 with an existing interface.
+pick_subnet() {
+	used=$(used_subnets)
+	for candidate in $SUBNET_CANDIDATES; do
+		prefix=$(echo "$candidate" | cut -d. -f1-3)
+		conflict=0
+		for taken in $used; do
+			taken_prefix=$(echo "$taken" | cut -d. -f1-3)
+			if [ "$taken_prefix" = "$prefix" ]; then
+				conflict=1
+				break
+			fi
+		done
+		[ "$conflict" -eq 0 ] || continue
+		printf '%s\n' "$candidate"
+		return 0
+	done
+	return 1
+}
+
+# Echoes a non-negative integer, or fails.
+valid_uint() {
+	case "$1" in
+		'' | *[!0-9]*) return 1 ;;
+	esac
+	return 0
+}
+
+# Validates an IPv4 CIDR such as 192.168.50.1/24 and echoes it in normalised
+# form. Rejects non-numeric or out-of-range octets, out-of-range prefixes,
+# leading zeros (which are ambiguous), and -- for prefixes of 30 or less -- the
+# network and broadcast addresses, since neither can serve as an interface
+# address.
+valid_cidr() {
+	addr=$(printf '%s' "$1" | awk '
+		{
+			slash = index($0, "/")
+			if (slash == 0) exit 1
+			addr = substr($0, 1, slash - 1)
+			prefix = substr($0, slash + 1)
+			if (prefix !~ /^[0-9]+$/) exit 1
+			prefix += 0
+			if (prefix < 1 || prefix > 32) exit 1
+			if (split(addr, octet, ".") != 4) exit 1
+			value = 0
+			for (i = 1; i <= 4; i++) {
+				if (octet[i] !~ /^[0-9]+$/) exit 1
+				if (length(octet[i]) > 1 && substr(octet[i], 1, 1) == "0") exit 1
+				n = octet[i] + 0
+				if (n > 255) exit 1
+				value = value * 256 + n
+			}
+			if (prefix <= 30) {
+				span = 2 ^ (32 - prefix)
+				host = value % span
+				if (host == 0) exit 1
+				if (host == span - 1) exit 1
+			}
+			print addr "/" prefix
+		}')
+	[ -n "$addr" ] || return 1
+	printf '%s\n' "$addr"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# config backup / rollback
+# ---------------------------------------------------------------------------
+
+backup_configs() {
+	rm -rf "$BACKUP_DIR"
+	mkdir -p "$BACKUP_DIR" || return 1
+	for name in $CONFIG_FILES; do
+		# Every config must be snapshotted. Skipping a missing one would leave
+		# a partial rollback point, so refuse to touch anything instead.
+		[ -f "/etc/config/$name" ] || return 1
+		cp -p "/etc/config/$name" "$BACKUP_DIR/$name" || return 1
+	done
+	return 0
+}
+
+rollback_configs() {
+	for name in $CONFIG_FILES; do
+		[ -f "$BACKUP_DIR/$name" ] || continue
+		cp -p "$BACKUP_DIR/$name" "/etc/config/$name" || return 1
+	done
+	rm -rf "$BACKUP_DIR"
+}
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+
+method_status() {
+	warnings=""
+	radios_json=""
+	first=1
+
+	for radio in $(list_radios); do
+		band=$(uci -q get "wireless.$radio.band")
+		channel=$(uci -q get "wireless.$radio.channel")
+		[ -n "$channel" ] || continue
+
+		dfs=false
+		is_dfs_channel "$channel" && dfs=true
+
+		phy=$(uci -q get "wireless.$radio.path")
+		# Compare against the literal sentinel: `[ -n "$first" ]` would be true
+		# for "0" as well, so the separator would never be inserted.
+		if [ "$first" = "1" ]; then
+			first=0
+		else
+			radios_json="$radios_json,"
+		fi
+		radios_json="$radios_json{\"section\":\"$(json_escape "$radio")\",\"band\":\"$(json_escape "$band")\",\"channel\":\"$(json_escape "$channel")\",\"dfs\":$dfs,\"path\":\"$(json_escape "$phy")\"}"
+	done
+
+	rec2g=$(pick_radio 2g 0)
+	rec5g=$(pick_radio 5g 1)
+	[ -n "$rec2g" ] || warnings="$warnings;no 2.4 GHz radio found"
+	if [ -z "$rec5g" ]; then
+		warnings="$warnings;no 5 GHz radio found"
+	elif echo "$rec5g" | grep -q dfs-only; then
+		warnings="$warnings;the only 5 GHz radio sits on a DFS channel, the guest 5 GHz SSID will drop out during radar detection"
+	fi
+
+	r2g_section=$(echo "$rec2g" | cut -d' ' -f1)
+	r5g_section=$(echo "$rec5g" | cut -d' ' -f1)
+	r5g_reason=$(echo "$rec5g" | cut -d' ' -f3)
+
+	nonwildcard=$(uci -q get dhcp.@dnsmasq[0].nonwildcard)
+	registered=false
+	[ "$nonwildcard" = "1" ] || registered=true
+	if [ "$registered" = false ]; then
+		for iface in $(uci -q get dhcp.@dnsmasq[0].interface); do
+			[ "$iface" = "$GUEST_NETIFACE" ] && registered=true
+		done
+	fi
+	if [ "$nonwildcard" = "1" ] && [ "$registered" = false ]; then
+		warnings="$warnings;dnsmasq runs nonwildcard=1 and $GUEST_NETIFACE is not a listening interface, guests would never get a lease"
+	fi
+
+	guest_enabled=false
+	[ -n "$(uci -q get "network.$GUEST_NETIFACE.proto")" ] && guest_enabled=true
+
+	ssid2g=$(uci -q get "wireless.jdcguest_2g.ssid")
+	ssid5g=$(uci -q get "wireless.jdcguest_5g.ssid")
+
+	result="{
+		\"board\":\"$(json_escape "$(ubus call system board 2>/dev/null | jsonfilter -e '@.board_name' 2>/dev/null)")\",
+		\"model\":\"$(json_escape "$(ubus call system board 2>/dev/null | jsonfilter -e '@.model' 2>/dev/null)")\",
+		\"radios\":[$radios_json],
+		\"recommend\":{
+			\"band_2g\":\"$(json_escape "$r2g_section")\",
+			\"band_5g\":\"$(json_escape "$r5g_section")\",
+			\"band_5g_state\":\"$(json_escape "$r5g_reason")\"
+		},
+		\"nonwildcard\":\"$(json_escape "$nonwildcard")\",
+		\"dnsmasq_registered\":$registered,
+		\"guest_enabled\":$guest_enabled,
+		\"guest\":{
+			\"subnet\":\"$(json_escape "$(uci -q get "network.$GUEST_NETIFACE.ipaddr")")\",
+			\"ssid_2g\":\"$(json_escape "$ssid2g")\",
+			\"ssid_5g\":\"$(json_escape "$ssid5g")\",
+			\"isolate_2g\":\"$(json_escape "$(uci -q get wireless.jdcguest_2g.isolate)")\",
+			\"isolate_5g\":\"$(json_escape "$(uci -q get wireless.jdcguest_5g.isolate)")\"
+		},
+		\"warnings\":\"$(json_escape "$(echo "$warnings" | sed 's/^;//')")\"
+	}"
+	reply_ok "$result"
+}
+
+# ---------------------------------------------------------------------------
+# apply
+# ---------------------------------------------------------------------------
+
+# Registers the guest interface with dnsmasq when nonwildcard is active.
+# Without this the interface comes up, hostapd beacons, and no client ever gets
+# an address -- the most common guest-network failure mode on this firmware.
+register_dnsmasq_listener() {
+	[ "$(uci -q get dhcp.@dnsmasq[0].nonwildcard)" = "1" ] || return 0
+	for iface in $(uci -q get dhcp.@dnsmasq[0].interface); do
+		[ "$iface" = "$GUEST_NETIFACE" ] && return 0
+	done
+	uci add_list "dhcp.@dnsmasq[0].interface=$GUEST_NETIFACE"
+}
+
+configure_network() {
+	subnet=$1
+
+	uci -q delete "network.jdcguest_dev"
+	uci set "network.jdcguest_dev=device"
+	uci set "network.jdcguest_dev.type=bridge"
+	uci set "network.jdcguest_dev.name=$GUEST_BRIDGE"
+	# An empty bridge stays administratively up even with no wireless member,
+	# which keeps the DHCP server answering before radios finish associating.
+	uci set "network.jdcguest_dev.bridge_empty=1"
+
+	uci -q delete "network.$GUEST_NETIFACE"
+	uci set "network.$GUEST_NETIFACE=interface"
+	uci set "network.$GUEST_NETIFACE.device=$GUEST_BRIDGE"
+	uci set "network.$GUEST_NETIFACE.proto=static"
+	uci set "network.$GUEST_NETIFACE.ipaddr=$subnet"
+}
+
+configure_dhcp() {
+	start=$1
+	limit=$2
+
+	uci -q delete "dhcp.$GUEST_NETIFACE"
+	uci set "dhcp.$GUEST_NETIFACE=dhcp"
+	uci set "dhcp.$GUEST_NETIFACE.interface=$GUEST_NETIFACE"
+	uci set "dhcp.$GUEST_NETIFACE.start=$start"
+	uci set "dhcp.$GUEST_NETIFACE.limit=$limit"
+	uci set "dhcp.$GUEST_NETIFACE.leasetime=1h"
+}
+
+configure_firewall() {
+	uci -q delete "firewall.jdcguest_zone"
+	uci set "firewall.jdcguest_zone=zone"
+	uci set "firewall.jdcguest_zone.name=$GUEST_ZONE"
+	uci set "firewall.jdcguest_zone.network=$GUEST_NETIFACE"
+	uci set "firewall.jdcguest_zone.input=REJECT"
+	uci set "firewall.jdcguest_zone.output=ACCEPT"
+	# REJECT blocks guests from reaching 10.0.0.0/24 and everything behind it.
+	uci set "firewall.jdcguest_zone.forward=REJECT"
+	# This board is an AP behind another router, so guest traffic needs its own
+	# NAT to get out. Also handles upstream networks that refuse the RFC1918 source.
+	uci set "firewall.jdcguest_zone.masq=1"
+
+	uci -q delete "firewall.jdcguest_dns"
+	uci set "firewall.jdcguest_dns=rule"
+	uci set "firewall.jdcguest_dns.name=Allow-DNS-Guest"
+	uci set "firewall.jdcguest_dns.src=$GUEST_ZONE"
+	uci set "firewall.jdcguest_dns.proto=tcp udp"
+	uci set "firewall.jdcguest_dns.dest_port=53"
+	uci set "firewall.jdcguest_dns.target=ACCEPT"
+
+	uci -q delete "firewall.jdcguest_dhcp"
+	uci set "firewall.jdcguest_dhcp=rule"
+	uci set "firewall.jdcguest_dhcp.name=Allow-DHCP-Guest"
+	uci set "firewall.jdcguest_dhcp.src=$GUEST_ZONE"
+	uci set "firewall.jdcguest_dhcp.proto=tcp udp"
+	uci set "firewall.jdcguest_dhcp.dest_port=67"
+	uci set "firewall.jdcguest_dhcp.target=ACCEPT"
+
+	uci -q delete "firewall.jdcguest_wan"
+	uci set "firewall.jdcguest_wan=forwarding"
+	uci set "firewall.jdcguest_wan.src=$GUEST_ZONE"
+	uci set "firewall.jdcguest_wan.dest=wan"
+}
+
+configure_wireless() {
+	suffix=$1
+	radio=$2
+	ssid=$3
+	key=$4
+	isolate=$5
+
+	[ -n "$radio" ] || return 0
+	[ -n "$ssid" ] || return 0
+
+	# The section name carries the band, not the radio index: jdcguest_2g and
+	# jdcguest_5g are what method_status and method_remove look for, and they
+	# stay stable no matter which radio the detection logic settles on.
+	section="wireless.jdcguest_$suffix"
+
+	uci -q delete "$section"
+	uci set "$section=wifi-iface"
+	uci set "$section.device=$radio"
+	uci set "$section.mode=ap"
+	uci set "$section.network=$GUEST_NETIFACE"
+	uci set "$section.ssid=$ssid"
+	uci set "$section.encryption=psk2+ccmp"
+	uci set "$section.key=$key"
+	uci set "$section.isolate=$isolate"
+	uci set "$section.disabled=0"
+}
+
+method_apply() {
+	ssid2g=$1
+	ssid5g=$2
+	key=$3
+	subnet=$4
+	isolate2g=$5
+	isolate5g=$6
+	dhcp_start=$7
+	dhcp_limit=$8
+
+	# A blank passphrase from the form means "keep whatever is in effect", which
+	# may only exist in /etc/config/wireless from a previous apply.
+	if [ -z "$key" ]; then
+		key=$(uci -q get jdcguest.jdcguest.key)
+	fi
+	if [ -z "$key" ]; then
+		key=$(uci -q get wireless.jdcguest_2g.key)
+	fi
+
+	if [ -z "$ssid2g" ] && [ -z "$ssid5g" ]; then
+		reply_err "At least one guest SSID is required."
+		return
+	fi
+	key_len=$(printf '%s' "$key" | wc -c)
+	if [ "$key_len" -lt 8 ] || [ "$key_len" -gt 63 ]; then
+		reply_err "The WPA2 passphrase must be between 8 and 63 characters."
+		return
+	fi
+	# Resolve "auto"/empty to a concrete subnet before validating, so the
+	# form's default value is not rejected by the CIDR check below.
+	if [ -z "$subnet" ] || [ "$subnet" = "auto" ]; then
+		subnet=$(pick_subnet) || { reply_err "No free guest subnet available."; return; }
+	fi
+	subnet=$(valid_cidr "$subnet") || {
+		reply_err "The guest subnet must be a valid IPv4 address in CIDR form, for example 192.168.50.1/24."
+		return
+	}
+
+	if ! valid_uint "$dhcp_start" || ! valid_uint "$dhcp_limit"; then
+		reply_err "The DHCP pool start and size must be whole numbers."
+		return
+	fi
+	if [ "$dhcp_start" -lt 2 ] || [ "$dhcp_start" -gt 254 ]; then
+		reply_err "The DHCP pool must start between 2 and 254."
+		return
+	fi
+	if [ "$dhcp_limit" -lt 1 ] || [ "$dhcp_limit" -gt 253 ]; then
+		reply_err "The DHCP pool size must be between 1 and 253."
+		return
+	fi
+	# The last address handed out must stay below the broadcast address.
+	if [ $((dhcp_start + dhcp_limit - 1)) -gt 254 ]; then
+		reply_err "The DHCP pool would run past the end of the subnet."
+		return
+	fi
+
+	r2g=$(pick_radio 2g 0) || { reply_err "No 2.4 GHz radio available."; return; }
+	r2g_section=$(echo "$r2g" | cut -d' ' -f1)
+	r5g=$(pick_radio 5g 1)
+	r5g_section=$(echo "$r5g" | cut -d' ' -f1)
+	r5g_reason=$(echo "$r5g" | cut -d' ' -f3)
+
+	backup_configs || { reply_err "Cannot snapshot /etc/config for rollback."; return; }
+
+	configure_network "$subnet"
+	configure_dhcp "$dhcp_start" "$dhcp_limit"
+	configure_firewall
+	configure_wireless 2g "$r2g_section" "$ssid2g" "$key" "$isolate2g"
+	if [ "$r5g_reason" = "ok" ]; then
+		configure_wireless 5g "$r5g_section" "$ssid5g" "$key" "$isolate5g"
+	else
+		# Only DFS-capable 5 GHz hardware is present: skip 5 GHz rather than hand
+		# guests a radio that vanishes during every radar sweep.
+		uci -q delete wireless.jdcguest_5g
+		ssid5g=""
+	fi
+	register_dnsmasq_listener
+
+	for name in $CONFIG_FILES; do
+		uci commit "$name" || { rollback_configs; reply_err "Failed to commit /etc/config/$name, configuration rolled back."; return; }
+	done
+
+	/etc/init.d/firewall reload > /dev/null 2>&1
+	/etc/init.d/network reload > /dev/null 2>&1
+	wifi reload > /dev/null 2>&1
+
+	rm -rf "$BACKUP_DIR"
+
+	notes="applied"
+	[ "$r5g_reason" = "ok" ] || notes="applied;5 GHz skipped (only a DFS radio is available)"
+
+	result="{
+		\"notes\":\"$(json_escape "$notes")\",
+		\"subnet\":\"$(json_escape "$subnet")\",
+		\"radio_2g\":\"$(json_escape "$r2g_section")\",
+		\"radio_5g\":\"$(json_escape "$r5g_section")\",
+		\"radio_5g_state\":\"$(json_escape "$r5g_reason")\",
+		\"ssid_2g\":\"$(json_escape "$ssid2g")\",
+		\"ssid_5g\":\"$(json_escape "$ssid5g")\"
+	}"
+	reply_ok "$result"
+}
+
+# ---------------------------------------------------------------------------
+# remove
+# ---------------------------------------------------------------------------
+
+method_remove() {
+	backup_configs || { reply_err "Cannot snapshot /etc/config for rollback."; return; }
+
+	uci -q delete "network.jdcguest_dev"
+	uci -q delete "network.$GUEST_NETIFACE"
+	uci -q delete "dhcp.$GUEST_NETIFACE"
+	uci -q delete "firewall.jdcguest_zone"
+	uci -q delete "firewall.jdcguest_dns"
+	uci -q delete "firewall.jdcguest_dhcp"
+	uci -q delete "firewall.jdcguest_wan"
+	uci -q delete wireless.jdcguest_2g
+	uci -q delete wireless.jdcguest_5g
+
+	# Drop the dnsmasq listener registration left behind by register_dnsmasq_listener.
+	for iface in $(uci -q get "dhcp.@dnsmasq[0].interface"); do
+		[ "$iface" = "$GUEST_NETIFACE" ] && uci -q del_list "dhcp.@dnsmasq[0].interface=$GUEST_NETIFACE"
+	done
+
+	for name in $CONFIG_FILES; do
+		uci commit "$name" || { rollback_configs; reply_err "Failed to commit /etc/config/$name, configuration rolled back."; return; }
+	done
+
+	/etc/init.d/firewall reload > /dev/null 2>&1
+	/etc/init.d/network reload > /dev/null 2>&1
+	wifi reload > /dev/null 2>&1
+
+	rm -rf "$BACKUP_DIR"
+	reply_ok '{"notes":"removed"}'
+}
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+
+request=$(cat)
+method=$(printf '%s' "$request" | jsonfilter -e '@.method')
+
+param() {
+	printf '%s' "$request" | jsonfilter -e "@.params.$1" 2>/dev/null
+}
+
+case "$method" in
+	status)
+		method_status
+		;;
+	apply)
+		method_apply \
+			"$(param ssid_2g)" \
+			"$(param ssid_5g)" \
+			"$(param key)" \
+			"$(param subnet)" \
+			"$(param isolate_2g)" \
+			"$(param isolate_5g)" \
+			"$(param dhcp_start)" \
+			"$(param dhcp_limit)"
+		;;
+	remove)
+		method_remove
+		;;
+	*)
+		reply_err "Unknown method: $method"
+		;;
+esac
