@@ -1,0 +1,10 @@
+# OpenWrt feeds are built from a checkout, so every text file must stay LF.
+# Without this, a Windows clone with core.autocrlf=true would turn the rpcd
+# backend into a shell script with CRLF line endings, which fails on the router.
+* text=auto eol=lf
+
+# Binary assets must never be touched.
+*.ipk binary
+*.apk binary
+*.gz binary
+*.mo binary
