@@ -61,12 +61,12 @@ install `luci-app-jdcguest`. After install the page lives at
 Consume it from `OpenWRT-CI` with:
 
 ```
-UPDATE_PACKAGE "jdcguest" "<owner>/luci-app-jdcguest" "main"
+UPDATE_PACKAGE "luci-app-jdcguest" "yufanpin/luci-app-jdcguest" "main"
 ```
 
 in `Scripts/Packages.sh`, plus `CONFIG_PACKAGE_luci-app-jdcguest=y` in
-`Config/GENERAL.txt`. The second field is `owner/repo`, so the package source only
-resolves once this tree is actually pushed somewhere.
+`Config/GENERAL.txt`. The second field is `owner/repo` and must point at a repository
+this tree is actually pushed to; the default branch is `main`.
 
 ## Scope and known limitations
 
