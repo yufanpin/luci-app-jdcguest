@@ -1,0 +1,17 @@
+{
+	"luci-app-jdcguest": {
+		"description": "Grant UCI access for luci-app-jdcguest",
+		"read": {
+			"uci": [ "jdcguest" ],
+			"ubus": {
+				"jdcguest": [ "status" ]
+			}
+		},
+		"write": {
+			"uci": [ "jdcguest" ],
+			"ubus": {
+				"jdcguest": [ "status", "apply", "remove" ]
+			}
+		}
+	}
+}
