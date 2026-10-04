@@ -1,0 +1,16 @@
+# OpenWrt build output
+*.ipk
+*.apk
+*.tar.gz
+*.po~
+po/*/*.mo
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Editor and OS noise
+*~
+*.swp
+.DS_Store
+Thumbs.db
